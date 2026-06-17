@@ -24,7 +24,7 @@ function bpFetch(path, key) {
       res.on("data", c => data += c);
       res.on("end", () => {
         try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch(e) { resolve({ status: res.statusCode, data: { raw: data.slice(0,200) } }); }
+        catch(e) { resolve({ status: res.statusCode, data: { raw: data.slice(0,500) } }); }
       });
     });
     req.on("error", reject);
@@ -32,62 +32,69 @@ function bpFetch(path, key) {
   });
 }
 
-// Extract positions from asset-wallets response
-function parseAssetWallets(d) {
+// Recursively find all wallets in any nested structure
+function findAllWallets(obj, results = []) {
+  if (!obj || typeof obj !== "object") return results;
+  if (Array.isArray(obj)) {
+    obj.forEach(item => findAllWallets(item, results));
+    return results;
+  }
+  // If this looks like a wallet (has balance or quantity and a symbol)
+  if (obj.type === "wallet" && obj.attributes) {
+    results.push(obj);
+    return results;
+  }
+  // Recurse into all keys
+  Object.values(obj).forEach(v => findAllWallets(v, results));
+  return results;
+}
+
+function parsePositions(d) {
   const positions = [];
   const attrs = d?.data?.attributes || {};
 
-  // Crypto
-  const cryptoWallets = attrs?.cryptocoin?.attributes?.wallets || [];
-  cryptoWallets.forEach(w => {
-    const a = w.attributes || {};
-    const bal = parseFloat(a.balance || 0);
-    const sym = (a.cryptocoin_symbol || "").toUpperCase();
-    if (bal > 0.000001 && sym && sym !== "EUR") {
-      positions.push({ symbol: sym, name: a.name || sym, amount: bal, type: "crypto" });
-    }
-  });
+  // Known asset group keys from debug response:
+  // cryptocoin, commodity, index, security, equity_security,
+  // etf, et_c, mutual_fund, stock, fiat_earn, equity_stock,
+  // equity_etf, equity_right, equity_complex_etf, equity_complex_etc
 
-  // Securities (stocks, ETFs)
-  const secWallets = attrs?.security?.attributes?.wallets ||
-                     attrs?.equity?.attributes?.wallets ||
-                     attrs?.stock?.attributes?.wallets || [];
-  secWallets.forEach(w => {
-    const a = w.attributes || {};
-    const qty = parseFloat(a.quantity || a.balance || a.shares || 0);
-    const sym = (a.symbol || a.asset_symbol || a.cryptocoin_symbol || "").toUpperCase();
-    const assetType = (a.asset_group || a.type || "stock").toLowerCase();
-    if (qty > 0 && sym) {
+  const allGroups = Object.keys(attrs);
+
+  allGroups.forEach(groupKey => {
+    const group = attrs[groupKey];
+    if (!group) return;
+
+    // Find all wallets in this group recursively
+    const wallets = findAllWallets(group);
+
+    wallets.forEach(w => {
+      const a = w.attributes || {};
+      const balance = parseFloat(a.balance || a.quantity || a.shares || 0);
+      if (balance <= 0.000001) return;
+
+      const sym = (a.cryptocoin_symbol || a.symbol || a.asset_symbol || "").toUpperCase();
+      if (!sym || sym === "EUR" || sym === "BEST") return;
+
+      // Determine type from group key
+      let type = "crypto";
+      if (groupKey.includes("stock") || groupKey.includes("equity") || groupKey === "security") {
+        type = "stock";
+      } else if (groupKey.includes("etf")) {
+        type = "etf";
+      } else if (groupKey.includes("commodity") || groupKey.includes("metal")) {
+        type = "commodity";
+      }
+
       positions.push({
         symbol: sym,
         name: a.name || a.asset_name || sym,
-        amount: qty,
-        type: assetType.includes("etf") ? "etf" : "stock",
-        isin: a.isin || ""
+        amount: balance,
+        type: type,
+        group: groupKey,
+        isin: a.isin || "",
+        walletId: w.id || ""
       });
-    }
-  });
-
-  // ETFs separately if grouped
-  const etfWallets = attrs?.etf?.attributes?.wallets || [];
-  etfWallets.forEach(w => {
-    const a = w.attributes || {};
-    const qty = parseFloat(a.quantity || a.balance || 0);
-    const sym = (a.symbol || a.asset_symbol || "").toUpperCase();
-    if (qty > 0 && sym) {
-      positions.push({ symbol: sym, name: a.name || sym, amount: qty, type: "etf" });
-    }
-  });
-
-  // Commodities/Metals
-  const metWallets = attrs?.commodity?.attributes?.wallets || attrs?.metal?.attributes?.wallets || [];
-  metWallets.forEach(w => {
-    const a = w.attributes || {};
-    const bal = parseFloat(a.balance || 0);
-    const sym = (a.cryptocoin_symbol || a.symbol || "").toUpperCase();
-    if (bal > 0 && sym) {
-      positions.push({ symbol: sym, name: a.name || sym, amount: bal, type: "commodity" });
-    }
+    });
   });
 
   return positions;
@@ -99,18 +106,14 @@ function calcAvgPrices(trades) {
   const counts = {};
   trades.forEach(t => {
     const a = t.attributes || {};
-    const type = (a.type || "").toLowerCase();
-    if (type !== "buy") return;
-    // Try to get symbol from wallet_id lookup or cryptocoin_id
-    // Use amount_fiat / amount_cryptocoin = price
+    if ((a.type || "").toLowerCase() !== "buy") return;
     const amtCrypto = parseFloat(a.amount_cryptocoin || 0);
-    const amtFiat = parseFloat(a.amount_fiat || 0);
-    const price = parseFloat(a.price || (amtCrypto > 0 ? amtFiat / amtCrypto : 0));
-    // We need symbol – it comes from wallet mapping, use cryptocoin_id as key for now
-    const key = a.wallet_id || a.cryptocoin_id || "";
-    if (key && price > 0) {
-      totals[key] = (totals[key] || 0) + price;
-      counts[key] = (counts[key] || 0) + 1;
+    const amtFiat   = parseFloat(a.amount_fiat || 0);
+    const price     = parseFloat(a.price || (amtCrypto > 0 ? amtFiat / amtCrypto : 0));
+    const walletId  = a.wallet_id || "";
+    if (walletId && price > 0) {
+      totals[walletId] = (totals[walletId] || 0) + price;
+      counts[walletId] = (counts[walletId] || 0) + 1;
     }
   });
   const avg = {};
@@ -123,12 +126,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  const path   = parsed.pathname;
   const apiKey = req.headers["x-api-key"] || BITPANDA_KEY;
 
   if (path === "/" || path === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", message: "Bitpanda Proxy läuft ✅", time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: "ok", message: "Bitpanda Proxy v3 läuft ✅", time: new Date().toISOString() }));
     return;
   }
 
@@ -140,47 +143,56 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (path === "/portfolio" || path === "/wallets") {
-      // Use /asset-wallets which returns ALL asset types grouped
       const [awRes, tradeRes] = await Promise.all([
         bpFetch("/v1/asset-wallets", apiKey),
         bpFetch("/v1/trades?page_size=100", apiKey)
       ]);
 
-      // Debug: include raw response structure
-      const rawKeys = Object.keys(awRes.data?.data?.attributes || {});
+      const positions  = parsePositions(awRes.data);
+      const trades     = tradeRes.data?.data || [];
+      const avgByWallet = calcAvgPrices(trades);
 
-      // Parse all positions
-      const positions = parseAssetWallets(awRes.data);
-
-      // Avg buy prices from trades
-      const trades = tradeRes.data?.data || [];
-      const avgPrices = calcAvgPrices(trades);
-
-      // Add buy prices where available
+      // Map wallet avg prices to positions
       positions.forEach(p => {
-        if (!p.buyPrice) p.buyPrice = 0; // will be filled from trades via wallet_id
+        if (p.walletId && avgByWallet[p.walletId]) {
+          p.buyPrice = parseFloat(avgByWallet[p.walletId].toFixed(4));
+        } else {
+          p.buyPrice = 0;
+        }
       });
+
+      const groups = Object.keys(awRes.data?.data?.attributes || {});
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         positions,
-        avgPrices,
+        avgPrices: avgByWallet,
         debug: {
-          assetWalletStatus: awRes.status,
-          assetGroups: rawKeys,
+          assetGroups: groups,
+          positionCount: positions.length,
           tradeCount: trades.length,
-          positionCount: positions.length
+          positionsByGroup: positions.reduce((acc, p) => {
+            acc[p.group] = (acc[p.group] || 0) + 1;
+            return acc;
+          }, {})
         },
         updated: new Date().toISOString()
       }));
       return;
     }
 
-    // Debug: raw asset-wallets dump
+    // Full debug dump
     if (path === "/debug") {
       const r = await bpFetch("/v1/asset-wallets", apiKey);
+      const groups = Object.keys(r.data?.data?.attributes || {});
+      const positions = parsePositions(r.data);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: r.status, keys: Object.keys(r.data?.data?.attributes || {}), raw: r.data }));
+      res.end(JSON.stringify({
+        status: r.status,
+        assetGroups: groups,
+        positionsFound: positions,
+        raw: r.data
+      }));
       return;
     }
 
@@ -189,8 +201,8 @@ const server = http.createServer(async (req, res) => {
 
   } catch(e) {
     res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: e.message }));
+    res.end(JSON.stringify({ error: e.message, stack: e.stack }));
   }
 });
 
-server.listen(PORT, () => console.log(`Bitpanda Proxy läuft auf Port ${PORT}`));
+server.listen(PORT, () => console.log(`Bitpanda Proxy v3 läuft auf Port ${PORT}`));
