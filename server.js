@@ -61,59 +61,50 @@ function parsePositions(d) {
   return positions;
 }
 
-// Calculate buy data from trades
-// amount_fiat = total EUR paid (incl. fee), amount_cryptocoin = units received
-// fee is read directly from trade data and subtracted for accurate price per unit
+// Calculate buy data from trades - match by cryptocoin_symbol
 function calcBuyData(trades) {
-  const byWallet = {};
+  const bySymbol = {};
 
   trades.forEach(t => {
     const a = t.attributes || {};
     const tradeType = (a.type || a.side || "").toLowerCase();
     if (!tradeType.includes("buy")) return;
 
-    const walletId = a.wallet_id || "";
-    if (!walletId) return;
+    // Use cryptocoin_symbol as key (reliable across crypto + stocks)
+    const sym = (a.cryptocoin_symbol || "").toUpperCase();
+    if (!sym || sym === "EUR") return;
 
-    const amtFiat  = parseFloat(a.amount_fiat || 0);   // total EUR paid incl. fee
-    const amtUnits = parseFloat(a.amount_cryptocoin || 0); // units received
-    const directPrice = parseFloat(a.price || 0); // direct price per unit if available (e.g. 905.70 for stocks)
+    const amtFiat  = parseFloat(a.amount_fiat || 0);
+    const amtUnits = parseFloat(a.amount_cryptocoin || 0);
+    const directPrice = parseFloat(a.price || 0);
 
-    // Extract fee from Bitpanda API response
-    // Correct field: fee.attributes.fee_amount_in_fiat
+    // Fee: fee.attributes.fee_amount_in_fiat (crypto) or null (stocks - in spread)
     const fee = parseFloat(
-      a.fee?.attributes?.fee_amount_in_fiat ||  // correct field (SOL: "0.75000000")
-      a.fee?.attributes?.fee_amount ||           // fallback
-      a.trading_fee ||                           // flat fallback
-      a.fee_amount_in_fiat ||                   // another fallback
+      a.fee?.attributes?.fee_amount_in_fiat ||
+      a.fee?.attributes?.fee_amount ||
+      a.trading_fee ||
       0
     );
 
     if (amtFiat <= 0 || amtUnits <= 0) return;
 
-    // Net amount = what you paid for the asset without fee
     const netFiat = amtFiat - fee;
 
-    // If API provides direct price per unit, use it (most accurate for stocks)
-    // Otherwise calculate from fiat/units
-    const calculatedPrice = directPrice > 0 ? directPrice : (netFiat / amtUnits);
-
-    if (!byWallet[walletId]) {
-      byWallet[walletId] = { totalFiat: 0, totalNetFiat: 0, totalUnits: 0, totalFee: 0, directPrice: 0 };
+    if (!bySymbol[sym]) {
+      bySymbol[sym] = { totalFiat: 0, totalNetFiat: 0, totalUnits: 0, totalFee: 0, directPrice: 0 };
     }
-    byWallet[walletId].totalFiat    += amtFiat;
-    byWallet[walletId].totalNetFiat += netFiat;
-    byWallet[walletId].totalUnits   += amtUnits;
-    byWallet[walletId].totalFee     += fee;
-    if (directPrice > 0) byWallet[walletId].directPrice = directPrice;
+    bySymbol[sym].totalFiat    += amtFiat;
+    bySymbol[sym].totalNetFiat += netFiat;
+    bySymbol[sym].totalUnits   += amtUnits;
+    bySymbol[sym].totalFee     += fee;
+    if (directPrice > 0) bySymbol[sym].directPrice = directPrice;
   });
 
   const result = {};
-  Object.keys(byWallet).forEach(wid => {
-    const { totalFiat, totalNetFiat, totalUnits, totalFee, directPrice } = byWallet[wid];
-    // Use direct price from API if available (most accurate), else calculate
+  Object.keys(bySymbol).forEach(sym => {
+    const { totalFiat, totalNetFiat, totalUnits, totalFee, directPrice } = bySymbol[sym];
     const pricePerUnit = directPrice > 0 ? directPrice : (totalNetFiat / totalUnits);
-    result[wid] = {
+    result[sym] = {
       totalInvested: parseFloat(totalFiat.toFixed(2)),
       pricePerUnit:  parseFloat(pricePerUnit.toFixed(4)),
       totalFee:      parseFloat(totalFee.toFixed(2))
@@ -153,14 +144,14 @@ const server = http.createServer(async (req, res) => {
       const trades    = tradeRes.data?.data || [];
       const buyData   = calcBuyData(trades);
 
-      // Match each position to its buy data via walletId
+      // Match positions to buy data via symbol (more reliable than walletId)
       positions.forEach(p => {
-        const bd = buyData[p.walletId];
+        const bd = buyData[p.symbol];
         if (bd) {
-          p.pricePerUnit  = bd.pricePerUnit;   // real market price per unit (excl. fee)
-          p.totalInvested = bd.totalInvested;  // gross EUR paid (incl. fee)
-          p.totalFee      = bd.totalFee;       // total trading fee paid
-          p.buyPrice      = bd.pricePerUnit;   // alias for compatibility
+          p.pricePerUnit  = bd.pricePerUnit;
+          p.totalInvested = bd.totalInvested;
+          p.totalFee      = bd.totalFee;
+          p.buyPrice      = bd.pricePerUnit;
         } else {
           p.pricePerUnit  = 0;
           p.totalInvested = 0;
