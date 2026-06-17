@@ -1,4 +1,4 @@
-const https = require("https");
+ const https = require("https");
 const http = require("http");
 const url = require("url");
 
@@ -62,8 +62,8 @@ function parsePositions(d) {
 }
 
 // Calculate buy data from trades
-// Key insight: amount_fiat = EUR paid, amount_cryptocoin = units received
-// pricePerUnit = amount_fiat / amount_cryptocoin
+// amount_fiat = total EUR paid (incl. fee), amount_cryptocoin = units received
+// fee is read directly from trade data and subtracted for accurate price per unit
 function calcBuyData(trades) {
   const byWallet = {};
 
@@ -75,27 +75,43 @@ function calcBuyData(trades) {
     const walletId = a.wallet_id || "";
     if (!walletId) return;
 
-    // amount_fiat: total EUR you paid (e.g. 50.00)
-    // amount_cryptocoin: units you received (e.g. 0.78180105)
-    const amtFiat  = parseFloat(a.amount_fiat || 0);
-    const amtUnits = parseFloat(a.amount_cryptocoin || 0);
+    const amtFiat  = parseFloat(a.amount_fiat || 0);   // total EUR paid incl. fee
+    const amtUnits = parseFloat(a.amount_cryptocoin || 0); // units received
+
+    // Extract fee from multiple possible locations in API response
+    const fee = parseFloat(
+      a.fee?.attributes?.fee_amount ||  // nested fee object
+      a.trading_fee ||                   // flat field
+      a.fee_amount ||                    // alternative flat field
+      a.fee ||                           // simple fee field
+      0
+    );
 
     if (amtFiat <= 0 || amtUnits <= 0) return;
 
-    if (!byWallet[walletId]) byWallet[walletId] = { totalFiat: 0, totalUnits: 0 };
-    byWallet[walletId].totalFiat  += amtFiat;
-    byWallet[walletId].totalUnits += amtUnits;
+    // Net amount = what you actually paid for the asset (without fee)
+    const netFiat = amtFiat - fee;
+
+    if (!byWallet[walletId]) {
+      byWallet[walletId] = { totalFiat: 0, totalNetFiat: 0, totalUnits: 0, totalFee: 0 };
+    }
+    byWallet[walletId].totalFiat    += amtFiat;   // gross (incl. fee)
+    byWallet[walletId].totalNetFiat += netFiat;   // net (excl. fee)
+    byWallet[walletId].totalUnits   += amtUnits;
+    byWallet[walletId].totalFee     += fee;
   });
 
   // Result per wallet:
-  // totalInvested = total EUR paid (e.g. 50.00 €)
-  // pricePerUnit  = totalFiat / totalUnits = avg EUR per unit (e.g. 63.95 €)
+  // totalInvested = gross EUR paid incl. fee (what left your account)
+  // pricePerUnit  = netFiat / units = real market price per unit
+  // totalFee      = total fees paid
   const result = {};
   Object.keys(byWallet).forEach(wid => {
-    const { totalFiat, totalUnits } = byWallet[wid];
+    const { totalFiat, totalNetFiat, totalUnits, totalFee } = byWallet[wid];
     result[wid] = {
       totalInvested: parseFloat(totalFiat.toFixed(2)),
-      pricePerUnit:  parseFloat((totalFiat / totalUnits).toFixed(4))
+      pricePerUnit:  parseFloat((totalNetFiat / totalUnits).toFixed(4)),
+      totalFee:      parseFloat(totalFee.toFixed(2))
     };
   });
   return result;
@@ -136,12 +152,14 @@ const server = http.createServer(async (req, res) => {
       positions.forEach(p => {
         const bd = buyData[p.walletId];
         if (bd) {
-          p.pricePerUnit  = bd.pricePerUnit;   // avg EUR per unit (e.g. 63.95)
-          p.totalInvested = bd.totalInvested;  // total EUR paid (e.g. 50.00)
+          p.pricePerUnit  = bd.pricePerUnit;   // real market price per unit (excl. fee)
+          p.totalInvested = bd.totalInvested;  // gross EUR paid (incl. fee)
+          p.totalFee      = bd.totalFee;       // total trading fee paid
           p.buyPrice      = bd.pricePerUnit;   // alias for compatibility
         } else {
           p.pricePerUnit  = 0;
           p.totalInvested = 0;
+          p.totalFee      = 0;
           p.buyPrice      = 0;
         }
       });
