@@ -32,7 +32,7 @@ function bpFetch(path, key) {
   });
 }
 
-// Recursively find all wallets in nested structure
+// Recursively find all wallets
 function findAllWallets(obj, results = []) {
   if (!obj || typeof obj !== "object") return results;
   if (Array.isArray(obj)) { obj.forEach(i => findAllWallets(i, results)); return results; }
@@ -44,64 +44,58 @@ function findAllWallets(obj, results = []) {
 function parsePositions(d) {
   const positions = [];
   const attrs = d?.data?.attributes || {};
-  const allGroups = Object.keys(attrs);
-
-  allGroups.forEach(groupKey => {
-    const wallets = findAllWallets(attrs[groupKey]);
-    wallets.forEach(w => {
+  Object.keys(attrs).forEach(groupKey => {
+    findAllWallets(attrs[groupKey]).forEach(w => {
       const a = w.attributes || {};
       const balance = parseFloat(a.balance || a.quantity || a.shares || 0);
       if (balance <= 0.000001) return;
       const sym = (a.cryptocoin_symbol || a.symbol || a.asset_symbol || "").toUpperCase();
       if (!sym || sym === "EUR" || sym === "BEST") return;
-
       let type = "crypto";
       if (groupKey.includes("stock") || groupKey.includes("equity") || groupKey === "security") type = "stock";
       else if (groupKey.includes("etf")) type = "etf";
       else if (groupKey.includes("commodity") || groupKey.includes("metal")) type = "commodity";
-
-      positions.push({
-        symbol: sym,
-        name: a.name || a.asset_name || sym,
-        amount: balance,
-        type,
-        isin: a.isin || "",
-        walletId: w.id || ""
-      });
+      positions.push({ symbol: sym, name: a.name || a.asset_name || sym, amount: balance, type, walletId: w.id || "", isin: a.isin || "" });
     });
   });
   return positions;
 }
 
-// Calculate per-unit buy price and total invested from trades
-// Bitpanda trades: amount_fiat = total EUR paid, amount_cryptocoin = units received
+// Calculate buy data from trades
+// Key insight: amount_fiat = EUR paid, amount_cryptocoin = units received
+// pricePerUnit = amount_fiat / amount_cryptocoin
 function calcBuyData(trades) {
-  // Group by wallet_id: collect all buy trades
   const byWallet = {};
+
   trades.forEach(t => {
     const a = t.attributes || {};
-    const type = (a.type || "").toLowerCase();
-    if (type !== "buy") return;
+    const tradeType = (a.type || a.side || "").toLowerCase();
+    if (!tradeType.includes("buy")) return;
 
     const walletId = a.wallet_id || "";
-    const amtFiat = parseFloat(a.amount_fiat || 0);      // total EUR paid
-    const amtUnits = parseFloat(a.amount_cryptocoin || 0); // units received
-    const feeAmt = parseFloat(a.fee?.attributes?.fee_amount || a.trading_fee || 0);
+    if (!walletId) return;
 
-    if (!walletId || amtFiat <= 0 || amtUnits <= 0) return;
+    // amount_fiat: total EUR you paid (e.g. 50.00)
+    // amount_cryptocoin: units you received (e.g. 0.78180105)
+    const amtFiat  = parseFloat(a.amount_fiat || 0);
+    const amtUnits = parseFloat(a.amount_cryptocoin || 0);
+
+    if (amtFiat <= 0 || amtUnits <= 0) return;
 
     if (!byWallet[walletId]) byWallet[walletId] = { totalFiat: 0, totalUnits: 0 };
-    byWallet[walletId].totalFiat += amtFiat;
+    byWallet[walletId].totalFiat  += amtFiat;
     byWallet[walletId].totalUnits += amtUnits;
   });
 
-  // Calculate avg price per unit and total invested per wallet
+  // Result per wallet:
+  // totalInvested = total EUR paid (e.g. 50.00 €)
+  // pricePerUnit  = totalFiat / totalUnits = avg EUR per unit (e.g. 63.95 €)
   const result = {};
   Object.keys(byWallet).forEach(wid => {
     const { totalFiat, totalUnits } = byWallet[wid];
     result[wid] = {
-      pricePerUnit: totalUnits > 0 ? totalFiat / totalUnits : 0,  // avg EUR per unit
-      totalInvested: totalFiat                                      // total EUR spent
+      totalInvested: parseFloat(totalFiat.toFixed(2)),
+      pricePerUnit:  parseFloat((totalFiat / totalUnits).toFixed(4))
     };
   });
   return result;
@@ -112,12 +106,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  const path   = parsed.pathname;
   const apiKey = req.headers["x-api-key"] || BITPANDA_KEY;
 
   if (path === "/" || path === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", message: "Bitpanda Proxy v4 ✅", time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: "ok", message: "Bitpanda Proxy v5 ✅", time: new Date().toISOString() }));
     return;
   }
 
@@ -135,34 +129,45 @@ const server = http.createServer(async (req, res) => {
       ]);
 
       const positions = parsePositions(awRes.data);
-      const trades = tradeRes.data?.data || [];
-      const buyData = calcBuyData(trades);
+      const trades    = tradeRes.data?.data || [];
+      const buyData   = calcBuyData(trades);
 
-      // Match positions to buy data via walletId
+      // Match each position to its buy data via walletId
       positions.forEach(p => {
         const bd = buyData[p.walletId];
         if (bd) {
-          p.pricePerUnit = parseFloat(bd.pricePerUnit.toFixed(4));  // avg EUR per unit
-          p.totalInvested = parseFloat(bd.totalInvested.toFixed(2)); // total EUR spent
-          p.buyPrice = p.pricePerUnit; // keep for compatibility
+          p.pricePerUnit  = bd.pricePerUnit;   // avg EUR per unit (e.g. 63.95)
+          p.totalInvested = bd.totalInvested;  // total EUR paid (e.g. 50.00)
+          p.buyPrice      = bd.pricePerUnit;   // alias for compatibility
         } else {
-          p.pricePerUnit = 0;
+          p.pricePerUnit  = 0;
           p.totalInvested = 0;
-          p.buyPrice = 0;
+          p.buyPrice      = 0;
         }
       });
-
-      const groups = Object.keys(awRes.data?.data?.attributes || {});
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         positions,
         debug: {
-          assetGroups: groups,
+          assetGroups: Object.keys(awRes.data?.data?.attributes || {}),
           positionCount: positions.length,
-          tradeCount: trades.length
+          tradeCount: trades.length,
+          // Show first trade raw so we can verify field names
+          sampleTrade: trades[0]?.attributes || null
         },
         updated: new Date().toISOString()
+      }));
+      return;
+    }
+
+    // Raw trade debug – shows exact field names from Bitpanda
+    if (path === "/trades-debug") {
+      const r = await bpFetch("/v1/trades?page_size=5", apiKey);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        count: r.data?.data?.length || 0,
+        trades: (r.data?.data || []).map(t => t.attributes)
       }));
       return;
     }
@@ -180,7 +185,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Route nicht gefunden. Verfügbar: /health, /portfolio, /debug" }));
+    res.end(JSON.stringify({ error: "Verfügbar: /health /portfolio /debug /trades-debug" }));
 
   } catch(e) {
     res.writeHead(500, { "Content-Type": "application/json" });
@@ -188,4 +193,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Bitpanda Proxy v4 läuft auf Port ${PORT}`));
+server.listen(PORT, () => console.log(`Bitpanda Proxy v5 läuft auf Port ${PORT}`));
