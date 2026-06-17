@@ -24,12 +24,98 @@ function bpFetch(path, key) {
       res.on("data", c => data += c);
       res.on("end", () => {
         try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch(e) { resolve({ status: res.statusCode, data: { raw: data } }); }
+        catch(e) { resolve({ status: res.statusCode, data: { raw: data.slice(0,200) } }); }
       });
     });
     req.on("error", reject);
     req.end();
   });
+}
+
+// Extract positions from asset-wallets response
+function parseAssetWallets(d) {
+  const positions = [];
+  const attrs = d?.data?.attributes || {};
+
+  // Crypto
+  const cryptoWallets = attrs?.cryptocoin?.attributes?.wallets || [];
+  cryptoWallets.forEach(w => {
+    const a = w.attributes || {};
+    const bal = parseFloat(a.balance || 0);
+    const sym = (a.cryptocoin_symbol || "").toUpperCase();
+    if (bal > 0.000001 && sym && sym !== "EUR") {
+      positions.push({ symbol: sym, name: a.name || sym, amount: bal, type: "crypto" });
+    }
+  });
+
+  // Securities (stocks, ETFs)
+  const secWallets = attrs?.security?.attributes?.wallets ||
+                     attrs?.equity?.attributes?.wallets ||
+                     attrs?.stock?.attributes?.wallets || [];
+  secWallets.forEach(w => {
+    const a = w.attributes || {};
+    const qty = parseFloat(a.quantity || a.balance || a.shares || 0);
+    const sym = (a.symbol || a.asset_symbol || a.cryptocoin_symbol || "").toUpperCase();
+    const assetType = (a.asset_group || a.type || "stock").toLowerCase();
+    if (qty > 0 && sym) {
+      positions.push({
+        symbol: sym,
+        name: a.name || a.asset_name || sym,
+        amount: qty,
+        type: assetType.includes("etf") ? "etf" : "stock",
+        isin: a.isin || ""
+      });
+    }
+  });
+
+  // ETFs separately if grouped
+  const etfWallets = attrs?.etf?.attributes?.wallets || [];
+  etfWallets.forEach(w => {
+    const a = w.attributes || {};
+    const qty = parseFloat(a.quantity || a.balance || 0);
+    const sym = (a.symbol || a.asset_symbol || "").toUpperCase();
+    if (qty > 0 && sym) {
+      positions.push({ symbol: sym, name: a.name || sym, amount: qty, type: "etf" });
+    }
+  });
+
+  // Commodities/Metals
+  const metWallets = attrs?.commodity?.attributes?.wallets || attrs?.metal?.attributes?.wallets || [];
+  metWallets.forEach(w => {
+    const a = w.attributes || {};
+    const bal = parseFloat(a.balance || 0);
+    const sym = (a.cryptocoin_symbol || a.symbol || "").toUpperCase();
+    if (bal > 0 && sym) {
+      positions.push({ symbol: sym, name: a.name || sym, amount: bal, type: "commodity" });
+    }
+  });
+
+  return positions;
+}
+
+// Calculate avg buy prices from trades
+function calcAvgPrices(trades) {
+  const totals = {};
+  const counts = {};
+  trades.forEach(t => {
+    const a = t.attributes || {};
+    const type = (a.type || "").toLowerCase();
+    if (type !== "buy") return;
+    // Try to get symbol from wallet_id lookup or cryptocoin_id
+    // Use amount_fiat / amount_cryptocoin = price
+    const amtCrypto = parseFloat(a.amount_cryptocoin || 0);
+    const amtFiat = parseFloat(a.amount_fiat || 0);
+    const price = parseFloat(a.price || (amtCrypto > 0 ? amtFiat / amtCrypto : 0));
+    // We need symbol – it comes from wallet mapping, use cryptocoin_id as key for now
+    const key = a.wallet_id || a.cryptocoin_id || "";
+    if (key && price > 0) {
+      totals[key] = (totals[key] || 0) + price;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+  });
+  const avg = {};
+  Object.keys(totals).forEach(k => { avg[k] = totals[k] / counts[k]; });
+  return avg;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -40,7 +126,6 @@ const server = http.createServer(async (req, res) => {
   const path = parsed.pathname;
   const apiKey = req.headers["x-api-key"] || BITPANDA_KEY;
 
-  // Health check
   if (path === "/" || path === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", message: "Bitpanda Proxy läuft ✅", time: new Date().toISOString() }));
@@ -55,84 +140,52 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (path === "/portfolio" || path === "/wallets") {
-      // Fetch crypto wallets AND stock/ETF positions in parallel
-      const [cryptoRes, stockRes, tradeRes] = await Promise.all([
-        bpFetch("/v1/wallets", apiKey),
-        bpFetch("/v1/securities", apiKey),           // stocks & ETFs
-        bpFetch("/v1/trades?page_size=100", apiKey)  // trade history for avg buy price
+      // Use /asset-wallets which returns ALL asset types grouped
+      const [awRes, tradeRes] = await Promise.all([
+        bpFetch("/v1/asset-wallets", apiKey),
+        bpFetch("/v1/trades?page_size=100", apiKey)
       ]);
 
-      // Process crypto wallets
-      const cryptoWallets = (cryptoRes.data.data || [])
-        .filter(w => parseFloat(w.attributes?.balance || 0) > 0)
-        .map(w => ({
-          symbol: (w.attributes?.cryptocoin_symbol || "").toUpperCase(),
-          name: w.attributes?.name || "",
-          amount: parseFloat(w.attributes?.balance || 0),
-          type: "crypto",
-          source: "bitpanda_wallet"
-        }));
+      // Debug: include raw response structure
+      const rawKeys = Object.keys(awRes.data?.data?.attributes || {});
 
-      // Process stock/ETF securities
-      const stockPositions = (stockRes.data.data || [])
-        .filter(s => parseFloat(s.attributes?.quantity || s.attributes?.amount || 0) > 0)
-        .map(s => {
-          const attrs = s.attributes || {};
-          return {
-            symbol: (attrs.symbol || attrs.isin || attrs.asset_symbol || "").toUpperCase(),
-            name: attrs.name || attrs.asset_name || attrs.symbol || "",
-            amount: parseFloat(attrs.quantity || attrs.amount || attrs.shares || 0),
-            type: attrs.asset_group?.includes("etf") ? "etf" : "stock",
-            isin: attrs.isin || "",
-            source: "bitpanda_securities"
-          };
-        });
+      // Parse all positions
+      const positions = parseAssetWallets(awRes.data);
 
-      // Calculate average buy prices from trade history
-      const trades = (tradeRes.data.data || []);
-      const avgPrices = {};
-      const tradeCount = {};
-      trades.forEach(t => {
-        const sym = (t.attributes?.cryptocoin_symbol || t.attributes?.symbol || "").toUpperCase();
-        const price = parseFloat(t.attributes?.price || t.attributes?.executed_price || 0);
-        const type = (t.attributes?.type || t.attributes?.side || "").toLowerCase();
-        if (sym && price > 0 && (type.includes("buy") || type === "buy")) {
-          if (!avgPrices[sym]) { avgPrices[sym] = 0; tradeCount[sym] = 0; }
-          avgPrices[sym] += price;
-          tradeCount[sym]++;
-        }
+      // Avg buy prices from trades
+      const trades = tradeRes.data?.data || [];
+      const avgPrices = calcAvgPrices(trades);
+
+      // Add buy prices where available
+      positions.forEach(p => {
+        if (!p.buyPrice) p.buyPrice = 0; // will be filled from trades via wallet_id
       });
-      Object.keys(avgPrices).forEach(sym => {
-        avgPrices[sym] = avgPrices[sym] / tradeCount[sym];
-      });
-
-      // Combine all positions
-      const allPositions = [...cryptoWallets, ...stockPositions].map(p => ({
-        ...p,
-        buyPrice: avgPrices[p.symbol] || 0
-      }));
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        positions: allPositions,
-        crypto: cryptoWallets,
-        stocks: stockPositions,
-        avgPrices: avgPrices,
+        positions,
+        avgPrices,
+        debug: {
+          assetWalletStatus: awRes.status,
+          assetGroups: rawKeys,
+          tradeCount: trades.length,
+          positionCount: positions.length
+        },
         updated: new Date().toISOString()
       }));
       return;
     }
 
-    // Individual endpoints
-    if (path === "/securities") {
-      const r = await bpFetch("/v1/securities", apiKey);
-      res.writeHead(r.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(r.data));
+    // Debug: raw asset-wallets dump
+    if (path === "/debug") {
+      const r = await bpFetch("/v1/asset-wallets", apiKey);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: r.status, keys: Object.keys(r.data?.data?.attributes || {}), raw: r.data }));
       return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Route nicht gefunden. Verfügbar: /health, /portfolio, /securities, /wallets" }));
+    res.end(JSON.stringify({ error: "Route nicht gefunden. Verfügbar: /health, /portfolio, /debug" }));
 
   } catch(e) {
     res.writeHead(500, { "Content-Type": "application/json" });
