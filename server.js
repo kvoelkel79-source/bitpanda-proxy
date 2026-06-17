@@ -1,4 +1,4 @@
- const https = require("https");
+const https = require("https");
 const http = require("http");
 const url = require("url");
 
@@ -77,40 +77,45 @@ function calcBuyData(trades) {
 
     const amtFiat  = parseFloat(a.amount_fiat || 0);   // total EUR paid incl. fee
     const amtUnits = parseFloat(a.amount_cryptocoin || 0); // units received
+    const directPrice = parseFloat(a.price || 0); // direct price per unit if available (e.g. 905.70 for stocks)
 
-    // Extract fee from multiple possible locations in API response
+    // Extract fee from Bitpanda API response
+    // Correct field: fee.attributes.fee_amount_in_fiat
     const fee = parseFloat(
-      a.fee?.attributes?.fee_amount ||  // nested fee object
-      a.trading_fee ||                   // flat field
-      a.fee_amount ||                    // alternative flat field
-      a.fee ||                           // simple fee field
+      a.fee?.attributes?.fee_amount_in_fiat ||  // correct field (SOL: "0.75000000")
+      a.fee?.attributes?.fee_amount ||           // fallback
+      a.trading_fee ||                           // flat fallback
+      a.fee_amount_in_fiat ||                   // another fallback
       0
     );
 
     if (amtFiat <= 0 || amtUnits <= 0) return;
 
-    // Net amount = what you actually paid for the asset (without fee)
+    // Net amount = what you paid for the asset without fee
     const netFiat = amtFiat - fee;
 
+    // If API provides direct price per unit, use it (most accurate for stocks)
+    // Otherwise calculate from fiat/units
+    const calculatedPrice = directPrice > 0 ? directPrice : (netFiat / amtUnits);
+
     if (!byWallet[walletId]) {
-      byWallet[walletId] = { totalFiat: 0, totalNetFiat: 0, totalUnits: 0, totalFee: 0 };
+      byWallet[walletId] = { totalFiat: 0, totalNetFiat: 0, totalUnits: 0, totalFee: 0, directPrice: 0 };
     }
-    byWallet[walletId].totalFiat    += amtFiat;   // gross (incl. fee)
-    byWallet[walletId].totalNetFiat += netFiat;   // net (excl. fee)
+    byWallet[walletId].totalFiat    += amtFiat;
+    byWallet[walletId].totalNetFiat += netFiat;
     byWallet[walletId].totalUnits   += amtUnits;
     byWallet[walletId].totalFee     += fee;
+    if (directPrice > 0) byWallet[walletId].directPrice = directPrice;
   });
 
-  // Result per wallet:
-  // totalInvested = gross EUR paid incl. fee (what left your account)
-  // pricePerUnit  = netFiat / units = real market price per unit
-  // totalFee      = total fees paid
   const result = {};
   Object.keys(byWallet).forEach(wid => {
-    const { totalFiat, totalNetFiat, totalUnits, totalFee } = byWallet[wid];
+    const { totalFiat, totalNetFiat, totalUnits, totalFee, directPrice } = byWallet[wid];
+    // Use direct price from API if available (most accurate), else calculate
+    const pricePerUnit = directPrice > 0 ? directPrice : (totalNetFiat / totalUnits);
     result[wid] = {
       totalInvested: parseFloat(totalFiat.toFixed(2)),
-      pricePerUnit:  parseFloat((totalNetFiat / totalUnits).toFixed(4)),
+      pricePerUnit:  parseFloat(pricePerUnit.toFixed(4)),
       totalFee:      parseFloat(totalFee.toFixed(2))
     };
   });
