@@ -56,6 +56,48 @@ function bpFetch(path, key) {
   return fetchJson("api.bitpanda.com", path, {"X-API-KEY": key});
 }
 
+// Yahoo Finance – unbegrenzte kostenlose Aktienkurse, kein API-Key nötig
+async function getStockPriceYahoo(symbol) {
+  try {
+    const r = await fetchJson("query1.finance.yahoo.com",
+      `/v8/finance/chart/${symbol}?interval=1d&range=1d`,
+      {"User-Agent": "Mozilla/5.0"}
+    );
+    const meta = r.data?.chart?.result?.[0]?.meta;
+    if (!meta) return null;
+    const priceUSD = meta.regularMarketPrice || meta.previousClose;
+    if (!priceUSD) return null;
+    // Get EUR/USD rate
+    const fxR = await fetchJson("query1.finance.yahoo.com",
+      `/v8/finance/chart/EURUSD=X?interval=1d&range=1d`,
+      {"User-Agent": "Mozilla/5.0"}
+    );
+    const eurUsd = fxR.data?.chart?.result?.[0]?.meta?.regularMarketPrice || 1.08;
+    const priceEUR = priceUSD / eurUsd;
+    const prevClose = meta.chartPreviousClose || meta.previousClose || priceUSD;
+    const change24h = ((priceUSD - prevClose) / prevClose) * 100;
+    return {
+      symbol,
+      priceUSD: parseFloat(priceUSD.toFixed(4)),
+      priceEUR: parseFloat(priceEUR.toFixed(4)),
+      change24h: parseFloat(change24h.toFixed(2)),
+      currency: meta.currency || "USD",
+      exchange: meta.exchangeName || "",
+      lastUpdated: new Date().toLocaleTimeString("de-DE")
+    };
+  } catch(e) { return null; }
+}
+
+// Batch stock prices via Yahoo Finance
+async function getStockPricesYahoo(symbols) {
+  const results = {};
+  await Promise.all(symbols.map(async sym => {
+    const data = await getStockPriceYahoo(sym);
+    if (data) results[sym] = data;
+  }));
+  return results;
+}
+
 // ── Data Sources ──────────────────────────────────────────────────────────────
 
 // 1. CoinGecko – Fear & Greed + Market data
@@ -349,13 +391,14 @@ async function runScanner(symbols, type, avKey, aiKey, ntfyTopic) {
         ]);
         Object.assign(signals, { cryptoData, orderbook, ticker, stocktwits, reddit });
       } else {
-        const [technical, insider, stocktwits, reddit] = await Promise.all([
-          getTechnicalIndicators(sym, avKey),
+        const [yahooPrice, technical, insider, stocktwits, reddit] = await Promise.all([
+          getStockPriceYahoo(sym),           // Yahoo Finance – unbegrenzt
+          getTechnicalIndicators(sym, avKey), // Alpha Vantage RSI/MACD (falls verfügbar)
           getInsiderData(sym),
           getStockTwitsSentiment(sym),
           getRedditMentions(sym)
         ]);
-        Object.assign(signals, { technical, insider, stocktwits, reddit });
+        Object.assign(signals, { yahooPrice, technical, insider, stocktwits, reddit });
       }
 
       const score = calcScore(signals, type);
