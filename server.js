@@ -498,7 +498,7 @@ const server = http.createServer(async (req, res) => {
 
   if(path==="/"||path==="/health"){
     res.writeHead(200,{"Content-Type":"application/json"});
-    res.end(JSON.stringify({status:"ok",message:"Bitpanda Proxy v6 + Scanner ✅",time:new Date().toISOString()}));
+    res.end(JSON.stringify({status:"ok",message:"Bitpanda Proxy v7 + Yahoo Finance ✅",time:new Date().toISOString()}));
     return;
   }
 
